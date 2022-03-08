@@ -1,0 +1,17 @@
+# 斐波那契数列函数定义
+def fib(x)
+    if x < 3 then
+        1
+    else
+        fib(x - 1) + fib(x - 2)
+
+fib(40)
+
+# 函数声明
+extern sin(arg)
+extern cos(arg)
+extern atan2(arg1 arg2)
+
+# 声明后的函数可调用
+atan2(sin(.4), cos(42))
+
