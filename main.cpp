@@ -339,6 +339,7 @@ unique_ptr<ExprAST> Parser::ParseBinOpRhs(
             return lhs;
         }
         int binop = g_current_token;
+        cout << "binop: " << (char)binop << endl;
         GetNextToken(); // eat binop
         auto rhs = ParsePrimary();
         // 现在我们有两种可能的解析方式
@@ -434,10 +435,29 @@ int FileCharStream::next()
     return fgetc(fp);
 }
 
+class StringCharStream : public Parser::CharStream
+{
+private:
+    string source;
+    int index = 0;
+
+public:
+    StringCharStream(string source) : source(source){};
+    ~StringCharStream(){};
+
+    int next();
+};
+
+int StringCharStream::next()
+{
+    return index < source.length() ? source.at(index++) : -1;
+}
+
 //
 
 void testGetToken()
 {
+    cout << "===============================" << endl;
     FileCharStream stream("sample-1.txt");
     Parser parser(&stream);
     int e;
@@ -446,32 +466,32 @@ void testGetToken()
         e = parser.GetToken();
         if (e == TOKEN_DEF)
         {
-            cout << "定义函数: " << endl;
+            printf("定义函数: \n");
         }
         else if (e == TOKEN_EXTERN)
         {
-            cout << "导出函数: " << endl;
+            printf("导出函数: \n");
         }
         else if (e == TOKEN_IDENTIFIER)
         {
-            cout << "identifier: " << parser.identifier() << endl;
+            printf("identifier: %s\n", parser.identifier().c_str());
         }
         else if (e == TOKEN_NUMBER)
         {
-            cout << "number: " << parser.number() << endl;
+            printf("number: %.1f\n", parser.number());
         }
         else if (e == TOKEN_EOF)
         {
-            cout << "End!" << endl;
+            printf("结束\n");
             break;
         }
     }
 }
 
-void testExpr()
+void testExpr(Parser::CharStream *stream)
 {
-    FileCharStream stream("sample-2.txt");
-    Parser parser(&stream);
+    cout << "===============================" << endl;
+    Parser parser(stream);
     parser.GetNextToken();
     while (true)
     {
@@ -502,9 +522,13 @@ void testExpr()
     return;
 }
 
+
 int main(int argc, char const *argv[])
 {
-    testGetToken();
-    testExpr();
+
+    // testGetToken();
+    // testExpr(new FileCharStream("sample-2.txt"));
+    testExpr(new StringCharStream("1+2*3-4"));
+
     return 0;
 }
