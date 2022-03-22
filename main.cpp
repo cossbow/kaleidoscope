@@ -9,13 +9,49 @@
 
 using namespace std;
 
+#include "main.h"
+
+// 记录了LLVM的核心数据结构，比如类型和常量表，不过我们不太需要关心它的内部
+LLVMContext g_llvm_context;
+// 用于创建LLVM指令
+IRBuilder<> g_ir_builder(g_llvm_context);
+// 用于管理函数和全局变量，可以粗浅地理解为类c++的编译单元(单个cpp文件)
+Module g_module("my cool jit", g_llvm_context);
+// 用于记录函数的变量参数
+std::map<std::string, Value *> g_named_values;
+
+class ASTContext
+{
+public:
+    LLVMContext llvmContext;
+    IRBuilder<> irBuilder;
+    Module module;
+    map<std::string, Value *> namedValues;
+
+public:
+    Value *doubleValue(double v)
+    {
+        return ConstantFP::get(llvmContext, APFloat(v));
+    }
+    Value *namedValue(string name)
+    {
+        return namedValues.at(name);
+    }
+    IRBuilder<> *getBuilder()
+    {
+        return &irBuilder;
+    }
+};
+
 //
 
+#ifndef __cpp_lib_make_unique
 template <typename T, typename... Ts>
 unique_ptr<T> make_unique(Ts &&...params)
 {
     return unique_ptr<T>(new T(forward<Ts>(params)...));
 }
+#endif
 
 //
 
@@ -38,69 +74,123 @@ enum Token
 // 所有 `表达式` 节点的基类
 class ExprAST
 {
+
+protected:
+    ASTContext &context;
+
 public:
+    ExprAST(ASTContext &context) : context(context) {}
+
     virtual ~ExprAST() {}
+    virtual Value *CodeGen() = 0;
 };
 
 // 字面值表达式
 class NumberExprAST : public ExprAST
 {
-public:
-    NumberExprAST(double val) : val_(val) {}
-
 private:
     double val_;
+
+public:
+    NumberExprAST(ASTContext &context, double val) : ExprAST(context), val_(val) {}
+    Value *CodeGen() override
+    {
+        return context.doubleValue(val_);
+    }
 };
 
 // 变量表达式
 class VariableExprAST : public ExprAST
 {
-public:
-    VariableExprAST(const string &name) : name_(name) {}
-
 private:
     string name_;
+
+public:
+    VariableExprAST(ASTContext &context, const string &name) : ExprAST(context), name_(name) {}
+    Value *CodeGen() override
+    {
+        return context.namedValue(name_);
+    }
 };
 
 // 二元操作表达式
 class BinaryExprAST : public ExprAST
 {
-public:
-    BinaryExprAST(char op, unique_ptr<ExprAST> lhs,
-                  unique_ptr<ExprAST> rhs)
-        : op_(op), lhs_(move(lhs)), rhs_(move(rhs)) {}
-
 private:
     char op_;
     unique_ptr<ExprAST> lhs_;
     unique_ptr<ExprAST> rhs_;
+
+public:
+    BinaryExprAST(ASTContext &context, char op, unique_ptr<ExprAST> lhs,
+                  unique_ptr<ExprAST> rhs)
+        : ExprAST(context), op_(op), lhs_(move(lhs)), rhs_(move(rhs)) {}
+
+    Value *CodeGen() override
+    {
+        Value *lhs = lhs_->CodeGen();
+        Value *rhs = rhs_->CodeGen();
+        switch (op_)
+        {
+        case '<':
+        {
+            Value *tmp = context.irBuilder.CreateFCmpULT(lhs, rhs, "cmptmp");
+            // 把 0/1 转为 0.0/1.0
+            return context.irBuilder.CreateUIToFP(
+                tmp, Type::getDoubleTy(g_llvm_context), "booltmp");
+        }
+        case '+':
+            return context.irBuilder.CreateFAdd(lhs, rhs, "addtmp");
+        case '-':
+            return context.irBuilder.CreateFSub(lhs, rhs, "subtmp");
+        case '*':
+            return context.irBuilder.CreateFMul(lhs, rhs, "multmp");
+        default:
+            return nullptr;
+        }
+    }
 };
 
 // 函数调用表达式
 class CallExprAST : public ExprAST
 {
-public:
-    CallExprAST(const string &callee,
-                vector<unique_ptr<ExprAST>> args)
-        : callee_(callee), args_(move(args)) {}
-
 private:
     string callee_;
     vector<unique_ptr<ExprAST>> args_;
+
+public:
+    CallExprAST(ASTContext &context,
+                const string &callee,
+                vector<unique_ptr<ExprAST>> args)
+        : ExprAST(context), callee_(callee), args_(move(args)) {}
+    Value *CodeGen() override
+    {
+        Function *callee = context.module.getFunction(callee_);
+        vector<Value *> args;
+        for (unique_ptr<ExprAST> &argExpr : args_)
+        {
+            args.push_back(argExpr->CodeGen());
+        }
+        return context.irBuilder.CreateCall(callee, args, "calltmp");
+    }
 };
 
 // 函数接口
 class PrototypeAST
 {
+    private:
+    string name_;
+    vector<string> args_;
 public:
     PrototypeAST(const string &name, vector<string> args)
         : name_(name), args_(move(args)) {}
-
     const string &name() const { return name_; }
 
-private:
-    string name_;
-    vector<string> args_;
+    Value*CodeGen() {
+        // TODO
+    }
+
+
 };
 
 // 函数
@@ -136,6 +226,7 @@ private:
 
     CharStream *stream;
 
+private:
 public:
     Parser(CharStream *stream) : stream(stream) {}
     ~Parser() {}
@@ -144,6 +235,7 @@ public:
     double number();
     int currentToken();
 
+    int nextChar();
     int GetToken();
     int GetNextToken();
     int GetTokenPrecedence();
@@ -173,18 +265,23 @@ double Parser::number()
     return g_number_val;
 }
 
+int Parser::nextChar()
+{
+    return last_char = stream->next();
+}
+
 int Parser::GetToken()
 {
     // 忽略空白字符
     while (isspace(last_char))
     {
-        last_char = stream->next();
+        nextChar();
     }
     // 识别字符串
     if (isalpha(last_char))
     {
         g_identifier_str = last_char;
-        while (isalnum((last_char = stream->next())))
+        while (isalnum((nextChar())))
         {
             g_identifier_str += last_char;
         }
@@ -208,7 +305,7 @@ int Parser::GetToken()
         do
         {
             num_str += last_char;
-            last_char = stream->next();
+            nextChar();
         } while (isdigit(last_char) || last_char == '.');
         g_number_val = strtod(num_str.c_str(), nullptr);
         return TOKEN_NUMBER;
@@ -218,7 +315,7 @@ int Parser::GetToken()
     {
         do
         {
-            last_char = stream->next();
+            nextChar();
         } while (last_char != EOF && last_char != '\n' && last_char != '\r');
         if (last_char != EOF)
         {
@@ -232,7 +329,7 @@ int Parser::GetToken()
     }
     // 直接返回ASCII
     int this_char = last_char;
-    last_char = stream->next();
+    nextChar();
     return this_char;
 }
 
@@ -463,7 +560,7 @@ void testGetToken()
     int e;
     while (true)
     {
-        e = parser.GetToken();
+        e = parser.GetNextToken();
         if (e == TOKEN_DEF)
         {
             printf("定义函数: \n");
@@ -500,35 +597,28 @@ void testExpr(Parser::CharStream *stream)
         case TOKEN_EOF:
             return;
         case TOKEN_DEF:
-        {
             parser.ParseDefinition();
             std::cout << "parsed a function definition" << std::endl;
             break;
-        }
         case TOKEN_EXTERN:
-        {
             parser.ParseExtern();
             std::cout << "parsed a extern" << std::endl;
             break;
-        }
         default:
-        {
             parser.ParseTopLevelExpr();
             std::cout << "parsed a top level expr" << std::endl;
             break;
-        }
         }
     }
     return;
 }
 
-
 int main(int argc, char const *argv[])
 {
 
     // testGetToken();
-    // testExpr(new FileCharStream("sample-2.txt"));
-    testExpr(new StringCharStream("1+2*3-4"));
+    testExpr(new FileCharStream("sample-2.txt"));
+    // testExpr(new StringCharStream("1+2*3-4"));
 
     return 0;
 }
