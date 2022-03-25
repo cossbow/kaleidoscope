@@ -18,7 +18,7 @@ IRBuilder<> g_ir_builder(g_llvm_context);
 // 用于管理函数和全局变量，可以粗浅地理解为类c++的编译单元(单个cpp文件)
 Module g_module("my cool jit", g_llvm_context);
 // 用于记录函数的变量参数
-std::map<std::string, Value *> g_named_values;
+map<string, Value *> g_named_values;
 
 class ASTContext
 {
@@ -26,7 +26,7 @@ public:
     LLVMContext llvmContext;
     IRBuilder<> irBuilder;
     Module module;
-    map<std::string, Value *> namedValues;
+    map<string, Value *> namedValues;
 
 public:
     Value *doubleValue(double v)
@@ -37,9 +37,13 @@ public:
     {
         return namedValues.at(name);
     }
-    IRBuilder<> *getBuilder()
+    void namedValue(string name, Value *value)
     {
-        return &irBuilder;
+        namedValues[name] = value;
+    }
+    void namedClear()
+    {
+        namedValues.clear();
     }
 };
 
@@ -137,7 +141,7 @@ public:
             Value *tmp = context.irBuilder.CreateFCmpULT(lhs, rhs, "cmptmp");
             // 把 0/1 转为 0.0/1.0
             return context.irBuilder.CreateUIToFP(
-                tmp, Type::getDoubleTy(g_llvm_context), "booltmp");
+                tmp, Type::getDoubleTy(context.llvmContext), "booltmp");
         }
         case '+':
             return context.irBuilder.CreateFAdd(lhs, rhs, "addtmp");
@@ -178,32 +182,75 @@ public:
 // 函数接口
 class PrototypeAST
 {
-    private:
+private:
+    ASTContext &context;
     string name_;
     vector<string> args_;
+
 public:
-    PrototypeAST(const string &name, vector<string> args)
-        : name_(name), args_(move(args)) {}
+    PrototypeAST(ASTContext &context, const string &name, vector<string> args)
+        : context(context), name_(name), args_(move(args)) {}
     const string &name() const { return name_; }
 
-    Value*CodeGen() {
-        // TODO
+    Function *CodeGen()
+    {
+        // 创建kaleidoscope的函数类型 double (doube, double, ..., double)
+        vector<Type *> doubles(args_.size(), Type::getDoubleTy(g_llvm_context));
+        // 函数类型是唯一的，所以使用get而不是new/create
+        FunctionType *function_type = FunctionType::get(Type::getDoubleTy(g_llvm_context), doubles, false);
+        // 创建函数, ExternalLinkage意味着函数可能不在当前module中定义，在当前module
+        // 即g_module中注册名字为name_, 后面可以使用这个名字在g_module中查询
+        Function *func = Function::Create(
+            function_type, Function::ExternalLinkage, name_, &g_module);
+        // 增加IR可读性，设置function的argument name
+        int index = 0;
+        for (auto &arg : func->args())
+        {
+            arg.setName(args_[index++]);
+        }
+        return func;
     }
-
-
 };
 
 // 函数
 class FunctionAST
 {
-public:
-    FunctionAST(unique_ptr<PrototypeAST> proto,
-                unique_ptr<ExprAST> body)
-        : proto_(move(proto)), body_(move(body)) {}
-
 private:
+    ASTContext &context;
     unique_ptr<PrototypeAST> proto_;
     unique_ptr<ExprAST> body_;
+
+public:
+    FunctionAST(ASTContext &context,
+                unique_ptr<PrototypeAST> proto,
+                unique_ptr<ExprAST> body)
+        : context(context), proto_(move(proto)), body_(move(body)) {}
+
+    Value *CodeGen()
+    {
+        // 检查函数声明是否已完成codegen(比如之前的extern声明), 如果没有则执行codegen
+        Function *func = context.module.getFunction(proto_->name());
+        if (func == nullptr)
+        {
+            func = proto_->CodeGen();
+        }
+        // 创建一个Block并且设置为指令插入位置。
+        // llvm block用于定义control flow graph, 由于我们暂不实现control flow, 创建
+        // 一个单独的block即可
+        BasicBlock *block = BasicBlock::Create(g_llvm_context, "entry", func);
+        context.irBuilder.SetInsertPoint(block);
+        // 将函数参数注册到context.namedValues中，让VariableExprAST可以codegen
+        context.namedClear();
+        for (Value &arg : func->args())
+        {
+            context.namedValue(arg.getName().str(), &arg);
+        }
+        // codegen body然后return
+        Value *ret_val = body_->CodeGen();
+        context.irBuilder.CreateRet(ret_val);
+        verifyFunction(*func);
+        return func;
+    }
 };
 
 //
@@ -597,17 +644,29 @@ void testExpr(Parser::CharStream *stream)
         case TOKEN_EOF:
             return;
         case TOKEN_DEF:
-            parser.ParseDefinition();
-            std::cout << "parsed a function definition" << std::endl;
+        {
+            auto ast = parser.ParseDefinition();
+            cout << "parsed a function definition" << endl;
+            ast->CodeGen()->print(llvm::errs());
+            std::cerr << std::endl;
             break;
+        }
         case TOKEN_EXTERN:
-            parser.ParseExtern();
-            std::cout << "parsed a extern" << std::endl;
+        {
+            auto ast = parser.ParseExtern();
+            cout << "parsed a extern" << endl;
+            ast->CodeGen()->print(llvm::errs());
+            std::cerr << std::endl;
             break;
+        }
         default:
-            parser.ParseTopLevelExpr();
-            std::cout << "parsed a top level expr" << std::endl;
+        {
+            auto ast = parser.ParseTopLevelExpr();
+            cout << "parsed a top level expr" << endl;
+            ast->CodeGen()->print(llvm::errs());
+            std::cerr << std::endl;
             break;
+        }
         }
     }
     return;
